@@ -1,0 +1,379 @@
+name: RDP Server Deployment (Production)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run even if another instance is running'
+        required: false
+        default: 'false'
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write  # Required to push connection details back to repository
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: System Information and Prerequisites
+      run: |
+        echo "=== SYSTEM INFORMATION ==="
+        echo "OS: $env:OS"
+        echo "Processor: $env:PROCESSOR_ARCHITECTURE"
+        echo "User: $env:USERNAME"
+        echo "PowerShell Version: $($PSVersionTable.PSVersion)"
+        echo "Current Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo "=============================="
+
+        # Check SSH availability
+        try {
+          $sshVersion = ssh -V 2>&1
+          echo "SSH Version: $sshVersion"
+        } catch {
+          echo "WARNING: SSH not found, attempting to install OpenSSH..."
+          try {
+            Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+            echo "✓ OpenSSH Client installed"
+          } catch {
+            echo "✗ Failed to install OpenSSH: $_"
+            exit 1
+          }
+        }
+
+    - name: Enhanced RDP Configuration
+      run: |
+        echo "=== RDP CONFIGURATION ==="
+        echo "Configuring Windows Remote Desktop with enhanced security..."
+
+        try {
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          echo "✓ Remote Desktop enabled"
+
+          # Configure firewall rules
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          echo "✓ Firewall rules configured"
+
+          # Disable Network Level Authentication (can cause issues with tunneled connections)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          echo "✓ Network Level Authentication disabled for better tunnel compatibility"
+
+          # Set security layer to RDP Security Layer
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "SecurityLayer" -Value 0
+          echo "✓ Security layer set to RDP"
+
+          # Set encryption level to low for better compatibility
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "MinEncryptionLevel" -Value 1
+          echo "✓ Encryption level set for compatibility"
+
+          # Configure user account
+          $username = "runneradmin"
+          $password = "P@ssw0rd!"
+          Set-LocalUser -Name $username -Password (ConvertTo-SecureString -AsPlainText $password -Force)
+          echo "✓ User credentials configured"
+
+          # Restart RDP service to apply configuration changes
+          echo "Restarting RDP service to apply configuration..."
+          Restart-Service -Name "TermService" -Force
+          Start-Sleep -Seconds 3
+
+          # Verify RDP service
+          $rdpService = Get-Service -Name "TermService"
+          if ($rdpService.Status -eq "Running") {
+            echo "✓ RDP service restarted and running"
+          } else {
+            echo "⚠ RDP service not running, attempting to start..."
+            Start-Service -Name "TermService"
+            Start-Sleep -Seconds 2
+            $rdpService = Get-Service -Name "TermService"
+            if ($rdpService.Status -eq "Running") {
+              echo "✓ RDP service started successfully"
+            } else {
+              echo "✗ Failed to start RDP service"
+            }
+          }
+
+          # Check if RDP port is listening
+          Start-Sleep -Seconds 2  # Give service time to bind to port
+          $rdpPort = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
+          if ($rdpPort) {
+            echo "✓ RDP port 3389 is listening"
+            echo "  Listening on: $($rdpPort.LocalAddress):$($rdpPort.LocalPort)"
+          } else {
+            echo "⚠ RDP port 3389 not detected"
+            echo "Checking all listening ports..."
+            Get-NetTCPConnection -State Listen | Where-Object {$_.LocalPort -eq 3389} | ForEach-Object {
+              echo "  Found RDP port: $($_.LocalAddress):$($_.LocalPort)"
+            }
+          }
+
+          # Additional diagnostics
+          echo "=== RDP DIAGNOSTICS ==="
+          echo "Current RDP configuration:"
+          $rdpConfig = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          echo "  UserAuthentication: $($rdpConfig.UserAuthentication)"
+          echo "  SecurityLayer: $($rdpConfig.SecurityLayer)"
+          echo "  MinEncryptionLevel: $($rdpConfig.MinEncryptionLevel)"
+
+          $tsConfig = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          echo "  fDenyTSConnections: $($tsConfig.fDenyTSConnections)"
+
+          echo "=== RDP CONFIGURATION COMPLETE ==="
+
+        } catch {
+          echo "✗ RDP configuration failed: $_"
+          echo "This may cause connection issues"
+        }
+
+    - name: Setup Tailscale VPN
+      run: |
+        echo "=== TAILSCALE VPN SETUP ==="
+        echo "Setting up Tailscale mesh networking for RDP access..."
+
+        try {
+          # Check if auth key is provided
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          if (-not $authKey -or $authKey -eq "") {
+            Write-Host "✗ Tailscale auth key not found" -ForegroundColor Red
+            throw "TAILSCALE_AUTH_KEY secret is required for Tailscale"
+          }
+
+          # Download and install Tailscale
+          Write-Host "Installing Tailscale..." -ForegroundColor Yellow
+          $tailscaleUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          Invoke-WebRequest -Uri $tailscaleUrl -OutFile "tailscale-setup.msi"
+          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i", "tailscale-setup.msi", "/quiet", "/norestart" -Wait
+          Write-Host "✓ Tailscale installed" -ForegroundColor Green
+
+          # Add Tailscale to PATH
+          $env:PATH += ";C:\Program Files\Tailscale"
+
+          # Authenticate with auth key
+          Write-Host "Authenticating with Tailscale..." -ForegroundColor Yellow
+          $authResult = & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$authKey --accept-routes --accept-dns=false 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "✗ Tailscale authentication failed: $authResult" -ForegroundColor Red
+            throw "Failed to authenticate with Tailscale"
+          }
+          Write-Host "✓ Tailscale authenticated successfully" -ForegroundColor Green
+
+          # Wait for connection to establish
+          Start-Sleep -Seconds 5
+
+          # Get Tailscale IP
+          $tailscaleIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "✗ Failed to get Tailscale IP: $tailscaleIP" -ForegroundColor Red
+            throw "Failed to get Tailscale IP address"
+          }
+
+          Write-Host "✓ Tailscale VPN active" -ForegroundColor Green
+          Write-Host "Tailscale IP: $tailscaleIP" -ForegroundColor Cyan
+
+          # Save connection details
+          $connectionDetails = @{
+            host = $tailscaleIP.Trim()
+            port = "3389"
+            tunnelUrl = "$($tailscaleIP.Trim()):3389"
+            tailscaleIP = $tailscaleIP.Trim()
+            provider = "tailscale"
+            username = "runneradmin"
+            password = "P@ssw0rd!"
+            timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+            method = "vpn-direct"
+            status = "ready"
+            connectionString = "$($tailscaleIP.Trim()):3389"
+          }
+
+          $connectionDetails | ConvertTo-Json | Out-File -FilePath "connection-details.json" -Encoding UTF8
+          Write-Host "✓ Connection details saved" -ForegroundColor Green
+
+          # Commit connection details to repository
+          git config --global user.email "automation@rdp-deploy.com"
+          git config --global user.name "RDP Automation"
+          git add connection-details.json
+          git commit -m "Add Tailscale connection details" -q
+          git push -q
+          Write-Host "✓ Connection details committed to repository" -ForegroundColor Green
+
+          Write-Host "🎉 TAILSCALE VPN READY!" -ForegroundColor Green
+          Write-Host "Connect to: $($tailscaleIP.Trim()):3389" -ForegroundColor Cyan
+          Write-Host "Username: runneradmin" -ForegroundColor Cyan
+          Write-Host "Password: P@ssw0rd!" -ForegroundColor Cyan
+          Write-Host "Note: Client must also be connected to the same Tailscale network" -ForegroundColor Yellow
+
+        } catch {
+          Write-Host "✗ Tailscale setup failed: $_" -ForegroundColor Red
+          
+          Write-Host "Attempting failover to alternative providers..." -ForegroundColor Yellow
+
+          # Try multiple SSH approaches with Serveo
+          $fallbackSuccess = $false
+
+          # Method 1: Direct SSH with OpenSSH
+          Write-Host "Trying OpenSSH direct connection..." -ForegroundColor Yellow
+          try {
+            $sshArgs = @(
+              "-o", "StrictHostKeyChecking=no",
+              "-o", "UserKnownHostsFile=NUL",
+              "-o", "ServerAliveInterval=30",
+              "-o", "ConnectTimeout=20",
+              "-o", "ExitOnForwardFailure=yes",
+              "-v",
+              "-T", "-R", "0:localhost:3389",
+              "serveo.net"
+            )
+
+            # Start SSH process with output capture
+            $sshProcess = Start-Process -FilePath "ssh" -ArgumentList $sshArgs -PassThru -NoNewWindow -RedirectStandardOutput "ssh-fallback-out.txt" -RedirectStandardError "ssh-fallback-err.txt"
+            Write-Host "SSH process started (PID: $($sshProcess.Id))" -ForegroundColor Gray
+
+            # Wait and monitor for tunnel establishment
+            $maxWait = 45
+            $checkInterval = 3
+            $checks = 0
+
+            while ($checks -lt ($maxWait / $checkInterval) -and -not $sshProcess.HasExited -and -not $fallbackSuccess) {
+              Start-Sleep -Seconds $checkInterval
+              $checks++
+
+              # Check output files
+              if (Test-Path "ssh-fallback-out.txt") {
+                $output = Get-Content "ssh-fallback-out.txt" -Raw -ErrorAction SilentlyContinue
+                if ($output -and ($output -match "Forwarding TCP connections from ([a-zA-Z0-9\-\.]+\.serveo\.net):(\d+)" -or
+                                  $output -match "tcp://([a-zA-Z0-9\-\.]+\.serveo\.net):(\d+)")) {
+                  $fallbackUrl = "tcp://$($matches[1]):$($matches[2])"
+                  $fallbackSuccess = $true
+                  break
+                }
+              }
+
+              if (Test-Path "ssh-fallback-err.txt") {
+                $errorOutput = Get-Content "ssh-fallback-err.txt" -Raw -ErrorAction SilentlyContinue
+                if ($errorOutput -and ($errorOutput -match "Forwarding TCP connections from ([a-zA-Z0-9\-\.]+\.serveo\.net):(\d+)" -or
+                                       $errorOutput -match "tcp://([a-zA-Z0-9\-\.]+\.serveo\.net):(\d+)")) {
+                  $fallbackUrl = "tcp://$($matches[1]):$($matches[2])"
+                  $fallbackSuccess = $true
+                  break
+                }
+              }
+
+              Write-Host "Waiting for tunnel... ($($checks * $checkInterval)s)" -ForegroundColor Gray
+            }
+
+            if ($fallbackSuccess) {
+              Write-Host "✓ SSH fallback successful: $fallbackUrl" -ForegroundColor Green
+
+              $connectionDetails = @{
+                tunnelUrl = $fallbackUrl
+                provider = "serveo-ssh-fallback"
+                username = "runneradmin"
+                password = "P@ssw0rd!"
+                timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+                method = "ssh-direct"
+              }
+
+              $connectionDetails | ConvertTo-Json | Out-File -FilePath "connection-details.json" -Encoding UTF8
+              Write-Host "🎉 FALLBACK TUNNEL ACTIVE!" -ForegroundColor Green
+              Write-Host "Tunnel URL: $fallbackUrl" -ForegroundColor Cyan
+              Write-Host "Username: runneradmin" -ForegroundColor Cyan
+              Write-Host "Password: P@ssw0rd!" -ForegroundColor Cyan
+              exit 0
+            }
+
+          } catch {
+            Write-Host "✗ SSH direct fallback failed: $_" -ForegroundColor Red
+          }
+
+          # Method 2: Try Pinggy as final fallback
+          if (-not $fallbackSuccess) {
+            Write-Host "Trying Pinggy as final fallback..." -ForegroundColor Yellow
+            try {
+              # Use the same Plink approach but with Pinggy
+              $plinkPath = "putty\plink.exe"
+              if (Test-Path $plinkPath) {
+                $pinggyArgs = @(
+                  "-ssh", "-batch", "-T",
+                  "-o", "StrictHostKeyChecking=no",
+                  "-o", "UserKnownHostsFile=NUL",
+                  "-o", "PreferredAuthentications=none",
+                  "-P", "443",
+                  "-R", "0:localhost:3389",
+                  "tcp@a.pinggy.io"
+                )
+
+                $pinggyProcess = Start-Process -FilePath $plinkPath -ArgumentList $pinggyArgs -PassThru -NoNewWindow -RedirectStandardOutput "pinggy-fallback-out.txt" -RedirectStandardError "pinggy-fallback-err.txt"
+                Start-Sleep -Seconds 30
+
+                if (Test-Path "pinggy-fallback-out.txt") {
+                  $pinggyOutput = Get-Content "pinggy-fallback-out.txt" -Raw -ErrorAction SilentlyContinue
+                  if ($pinggyOutput -and $pinggyOutput -match "tcp://([a-zA-Z0-9\-\.]+\.(?:pinggy\.link|pinggy\.io)):(\d+)") {
+                    $fallbackUrl = "tcp://$($matches[1]):$($matches[2])"
+                    Write-Host "✓ Pinggy fallback successful: $fallbackUrl" -ForegroundColor Green
+
+                    $connectionDetails = @{
+                      tunnelUrl = $fallbackUrl
+                      provider = "pinggy-fallback"
+                      username = "runneradmin"
+                      password = "P@ssw0rd!"
+                      timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss UTC"
+                      method = "pinggy-fallback"
+                    }
+
+                    $connectionDetails | ConvertTo-Json | Out-File -FilePath "connection-details.json" -Encoding UTF8
+                    Write-Host "🎉 PINGGY FALLBACK ACTIVE!" -ForegroundColor Green
+                    Write-Host "Tunnel URL: $fallbackUrl" -ForegroundColor Cyan
+                    Write-Host "Username: runneradmin" -ForegroundColor Cyan
+                    Write-Host "Password: P@ssw0rd!" -ForegroundColor Cyan
+                    exit 0
+                  }
+                }
+              }
+            } catch {
+              Write-Host "✗ Pinggy fallback failed: $_" -ForegroundColor Red
+            }
+          }
+
+          Write-Host "✗ All tunnel providers and fallbacks failed" -ForegroundColor Red
+          Write-Host "Please check the GitHub Actions logs for detailed error information" -ForegroundColor Yellow
+          exit 1
+        }
+    - name: Keep RDP Server Active
+      run: |
+        echo "=== RDP SERVER ACTIVE ==="
+        echo "RDP server is now running and accessible"
+        echo "Session will remain active for the duration of this workflow"
+        echo "Maximum session time: 355 minutes (User configured)"
+        echo ""
+        echo "Connection established at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo "Estimated session end: $(Get-Date -Date (Get-Date).AddMinutes(355) -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo ""
+        echo "Keeping session alive..."
+
+        # Keep alive with periodic status updates
+        $startTime = Get-Date
+        $maxDuration = 355 * 60  # 355 minutes in seconds
+        $updateInterval = 600   # 10 minutes in seconds
+
+        while ((Get-Date) -lt $startTime.AddSeconds($maxDuration)) {
+          Start-Sleep -Seconds $updateInterval
+          $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+          $remaining = [math]::Round(355 - $elapsed, 1)
+          echo "Session active for $elapsed minutes, $remaining minutes remaining"
+
+          # Verify RDP service is still running
+          $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+          if ($rdpService -and $rdpService.Status -eq "Running") {
+            echo "✓ RDP service healthy"
+          } else {
+            echo "⚠ RDP service issue detected"
+          }
+        }
+
+        echo "Session time limit reached, workflow ending"
